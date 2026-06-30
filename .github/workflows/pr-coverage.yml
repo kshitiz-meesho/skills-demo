@@ -9,16 +9,76 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
-      - name: Build and test with JaCoCo
-        run: mvn verify -B
+
+      - name: Run Maven verify with JaCoCo
+        id: build
+        run: |
+          set -o pipefail
+          mvn verify -B | tee build.log
+        continue-on-error: true
+
+      - name: Report JaCoCo coverage
+        id: coverage
+        if: always()
+        run: |
+          python - <<'PY'
+import os
+import xml.etree.ElementTree as ET
+import pathlib
+xml_path = pathlib.Path('target/site/jacoco/jacoco.xml')
+if not xml_path.exists():
+    print('No JaCoCo XML report found at target/site/jacoco/jacoco.xml')
+    with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+        out.write('coverage=0.00\n')
+    raise SystemExit(0)
+root = ET.parse(xml_path).getroot()
+line = None
+for counter in root.findall('counter'):
+    if counter.get('type') == 'LINE':
+        covered = int(counter.get('covered'))
+        missed = int(counter.get('missed'))
+        total = covered + missed
+        line = covered / total if total else 0.0
+        break
+if line is None:
+    raise SystemExit('LINE coverage counter not found')
+value = f'{line * 100:.2f}'
+print(f'JaCoCo line coverage: {value}%')
+with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+    out.write(f'coverage={value}\n')
+with open('coverage-summary.txt', 'w') as f:
+    f.write(value)
+PY
+
+      - name: Comment on PR with coverage result
+        if: always() && github.event_name == 'pull_request'
+        uses: peter-evans/create-or-update-comment@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            ### JaCoCo Coverage Report
+            - **Branch:** `${{ github.head_ref }}`
+            - **Target:** `${{ github.base_ref }}`
+            - **Line coverage:** `${{ steps.coverage.outputs.coverage }}%`
+            - **Required minimum:** `90%`
+            - **Result:** ${{ steps.build.outcome == 'success' && 'PASSED' || 'FAILED' }}
+
       - name: Upload JaCoCo report artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: jacoco-report
           path: target/site/jacoco
+
+      - name: Fail if Maven verify failed
+        if: ${{ steps.build.outcome != 'success' }}
+        run: |
+          echo "Maven verification failed. Coverage gate or tests did not pass."
+          exit 1
